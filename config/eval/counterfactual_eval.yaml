@@ -1,0 +1,93 @@
+# Counterfactual evaluation config for LeWM / TwoRoom.
+# Entry point: eval_cf.py
+
+seed: 42
+
+# World model checkpoint (run name or absolute path).
+policy: random   # override with actual ckpt name, e.g. lewm/tworoom/run_xyz
+
+# Linear probe checkpoint (trained via linear_probe.py).
+probe_ckpt: probe.pt
+
+# World model embed dim (must match the loaded checkpoint).
+wm:
+  embed_dim: 192
+  history_size: 1   # frames of context fed to encode()
+
+# Dataset to draw episodes from.
+dataset:
+  name: tworoom
+  keys_to_cache:
+    - action
+    - state
+    - proprio
+
+# Shared env rendering parameters.
+env:
+  img_size: 96
+  wall_width: 3
+  door_space: 4
+  border_wall_loc: 1
+
+# ── Per-task configs ──────────────────────────────────────────────────────────
+
+do_location:
+  t_intervene: [3, 5, 8, 10]
+  loc_prime: "offset_multi"
+  loc_prime_offsets_xy:
+    - [-14, 0]
+    - [14, 0]
+    - [0, -14]
+    - [0, 14]
+    - [-12, -12]
+    - [12, 12]
+    - [-12, 12]
+    - [12, -12]
+  use_fact_wall_door: true
+  action_source: "dataset"
+  require_effectful: true
+  min_oracle_effect_mse: 8.0
+  require_oracle_pass_change: true
+  target_effectful_n: 100
+  max_attempts: 3000
+
+do_door_y:
+  wall_x_fact: 32
+  door_y_fact: 24
+  door_y_cf: [12, 16, 20, 30, 36, 44, 52]
+  action_source: "dataset"
+  skip_same_value_eps: 1.0e-6
+  require_effectful: true
+  min_oracle_effect_mse: 2.0
+  require_oracle_pass_change: true
+  target_effectful_n: 100
+  max_attempts: 3000
+
+do_wall_x:
+  wall_x_fact: 32
+  wall_x_cf: [16, 20, 44, 48, 56]
+  door_y_fact: 24
+  action_source: "dataset"
+  skip_same_value_eps: 1.0e-6
+  require_effectful: true
+  min_oracle_effect_mse: 2.0
+  require_oracle_pass_change: true
+  target_effectful_n: 100
+  max_attempts: 3000
+
+do_door_y_wall_x:
+  wall_x_fact: 32
+  door_y_fact: 24
+  wall_x_cf: [16, 20, 44, 48, 56]
+  door_y_cf: [12, 16, 20, 30, 36, 44, 52]
+  pair_sampling: "random_k"   # full_grid | random_k
+  k_pairs_per_sample: 4
+  skip_same_value_eps: 1.0e-6
+  require_effectful: true
+  min_oracle_effect_mse: 2.0
+  require_oracle_pass_change: true
+  target_effectful_n: 100
+  max_attempts: 3000
+
+output:
+  filename: cf_results.json

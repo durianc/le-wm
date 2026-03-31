@@ -9,10 +9,113 @@ import hydra
 import numpy as np
 import stable_pretraining as spt
 import torch
+import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
+
+
+def patch_gcrl_compat(model):
+    """Patch backward-compat attributes for older serialized GCRL modules."""
+    for module in model.modules():
+        # Older checkpoints may deserialize Transformer without this attribute,
+        # while newer forward() expects it.
+        if module.__class__.__name__ == "Transformer" and not hasattr(module, "pool_type"):
+            module.pool_type = "attention"
+    return model
+
+
+class FastActionablePolicy(swm.policy.FeedForwardPolicy):
+    """Faster feed-forward policy with batched image preprocessing."""
+
+    def __init__(self, model, img_size, process=None, transform=None, **kwargs):
+        super().__init__(model=model, process=process, transform=transform, **kwargs)
+        self.img_size = int(img_size)
+        stats = spt.data.dataset_stats.ImageNet
+        self._mean = torch.tensor(stats["mean"]).view(1, 1, 3, 1, 1)
+        self._std = torch.tensor(stats["std"]).view(1, 1, 3, 1, 1)
+
+    def _prepare_image_tensor(self, x):
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(x)
+        # Expected shape: (E, T, H, W, C)
+        if x.ndim != 5:
+            return x
+
+        if x.shape[-1] == 3:
+            x = x.permute(0, 1, 4, 2, 3).contiguous()  # -> (E, T, C, H, W)
+        x = x.float()
+        if x.max() > 1.0:
+            x = x / 255.0
+
+        h, w = x.shape[-2], x.shape[-1]
+        if h != self.img_size or w != self.img_size:
+            et = x.shape[:2]
+            x = x.view(-1, *x.shape[-3:])
+            x = F.interpolate(
+                x,
+                size=(self.img_size, self.img_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+            x = x.view(*et, *x.shape[-3:])
+
+        mean = self._mean.to(device=x.device, dtype=x.dtype)
+        std = self._std.to(device=x.device, dtype=x.dtype)
+        x = (x - mean) / std
+        return x
+
+    def get_action(self, info_dict: dict, **kwargs) -> np.ndarray:
+        assert hasattr(self, "env"), "Environment not set for the policy"
+        assert "goal" in info_dict, "'goal' must be provided in info_dict"
+
+        # Shallow copy so we don't mutate env infos in place
+        info_dict = dict(info_dict)
+
+        # Lightweight numeric preprocessing (same semantics as base policy)
+        for k, v in list(info_dict.items()):
+            if not isinstance(v, (np.ndarray, np.generic)):
+                continue
+            if hasattr(self, "process") and k in self.process:
+                shape = v.shape
+                if len(shape) > 2:
+                    v_flat = v.reshape(-1, *shape[2:])
+                else:
+                    v_flat = v
+                v = self.process[k].transform(v_flat).reshape(shape)
+            info_dict[k] = v
+
+        # Keep compatibility with GCRL checkpoints expecting goal_pixels
+        if "goal" in info_dict:
+            info_dict["goal_pixels"] = info_dict["goal"]
+
+        # Batched image preprocessing
+        for key in ("pixels", "goal", "goal_pixels"):
+            if key in info_dict:
+                info_dict[key] = self._prepare_image_tensor(info_dict[key])
+
+        # Convert remaining numeric arrays to tensors
+        for k, v in list(info_dict.items()):
+            if isinstance(v, (np.ndarray, np.generic)) and v.dtype.kind not in "USO":
+                info_dict[k] = torch.from_numpy(v)
+
+        device = next(self.model.parameters()).device
+        for k, v in info_dict.items():
+            if torch.is_tensor(v):
+                info_dict[k] = v.to(device, non_blocking=True)
+
+        with torch.inference_mode():
+            action = self.model.get_action(info_dict)
+
+        if torch.is_tensor(action):
+            action = action.cpu().detach().numpy()
+
+        if "action" in self.process:
+            action = self.process["action"].inverse_transform(action)
+
+        return action
+
 
 def img_transform(cfg):
     transform = transforms.Compose(
@@ -55,7 +158,8 @@ def run(cfg: DictConfig):
 
     # create world environment
     cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
-    world = swm.World(**cfg.world, image_shape=(224, 224))
+    img_size = int(cfg.eval.img_size)
+    world = swm.World(**cfg.world, image_shape=(img_size, img_size))
 
     # create the transform
     transform = {
@@ -85,16 +189,32 @@ def run(cfg: DictConfig):
     policy = cfg.get("policy", "random")
 
     if policy != "random":
-        model = swm.policy.AutoCostModel(cfg.policy)
-        model = model.to("cuda")
-        model = model.eval()
-        model.requires_grad_(False)
-        model.interpolate_pos_encoding = True
-        config = swm.PlanConfig(**cfg.plan_config)
-        solver = hydra.utils.instantiate(cfg.solver, model=model)
-        policy = swm.policy.WorldModelPolicy(
-            solver=solver, config=config, process=process, transform=transform
-        )
+        try:
+            model = swm.policy.AutoCostModel(cfg.policy)
+            model = model.to("cuda")
+            model = patch_gcrl_compat(model)
+            model = model.eval()
+            model.requires_grad_(False)
+            model.interpolate_pos_encoding = True
+            config = swm.PlanConfig(**cfg.plan_config)
+            solver = hydra.utils.instantiate(cfg.solver, model=model)
+            policy = swm.policy.WorldModelPolicy(
+                solver=solver, config=config, process=process, transform=transform
+            )
+        except RuntimeError as e:
+            # Fallback for direct policy checkpoints (e.g., GCBC/IQL/IVL) that
+            # expose get_action but not get_cost.
+            if "get_cost" not in str(e):
+                raise
+            model = swm.policy.AutoActionableModel(cfg.policy)
+            model = model.to("cuda")
+            model = patch_gcrl_compat(model)
+            model = model.eval()
+            model.requires_grad_(False)
+            policy = FastActionablePolicy(
+                model=model, process=process, transform=transform
+                , img_size=cfg.eval.img_size
+            )
 
     else:
         policy = swm.policy.RandomPolicy()

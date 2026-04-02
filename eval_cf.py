@@ -29,11 +29,13 @@ import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from torchvision.transforms import v2 as T
+from tqdm import tqdm
 
 import stable_worldmodel as swm
+from stable_worldmodel.data.utils import get_cache_dir
 from cf_env import register_cf_env
 from cf_sampler import collect_effectful_samples
-from linear_probe import LinearProbe
+from probe import MLPProbe
 
 register_cf_env()
 
@@ -67,7 +69,7 @@ def _load_jepa(cfg: DictConfig, device: torch.device):
     if cfg.policy == "random":
         return None
 
-    model = swm.policy.AutoActionableModel(cfg.policy)
+    model = swm.policy.AutoCostModel(cfg.policy)
     # AutoActionableModel returns the module with get_action; we need encode().
     if not hasattr(model, "encode"):
         for child in model.children():
@@ -78,15 +80,23 @@ def _load_jepa(cfg: DictConfig, device: torch.device):
     return model
 
 
-def _load_probe(probe_ckpt: str, device: torch.device) -> LinearProbe | None:
+def _load_probe(probe_ckpt: str, device: torch.device) -> tuple[MLPProbe, dict] | tuple[None, None]:
     path = Path(probe_ckpt)
     if not path.exists():
-        return None
+        return None, None
     ckpt = torch.load(path, map_location=device, weights_only=True)
-    probe = LinearProbe(in_dim=ckpt["in_dim"], n_classes=2)
+    probe = MLPProbe(
+        in_dim=ckpt["in_dim"],
+        hidden_dim=ckpt.get("hidden_dim", 256),
+        out_dim=ckpt.get("out_dim", 2),
+    )
     probe.load_state_dict(ckpt["state_dict"])
     probe = probe.to(device).eval()
-    return probe
+    stats = {
+        "pos_mean": ckpt["pos_mean"].to(device),
+        "pos_std":  ckpt["pos_std"].to(device),
+    }
+    return probe, stats
 
 
 # ── Per-sample model evaluation ────────────────────────────────────────────────
@@ -94,7 +104,8 @@ def _load_probe(probe_ckpt: str, device: torch.device) -> LinearProbe | None:
 @torch.no_grad()
 def _model_predict_pass(
     model,
-    probe: LinearProbe,
+    probe: MLPProbe,
+    probe_stats: dict,
     env_params: dict,
     actions: np.ndarray,
     img_size: int,
@@ -103,49 +114,39 @@ def _model_predict_pass(
     history_size: int = 1,
 ) -> int | None:
     """
-    Encode the initial observation, roll out the model over `actions`,
-    then classify through_door with the linear probe.
+    Encode the initial observation, regress agent_pos with the linear probe,
+    then run oracle_rollout with the predicted position to get through_door.
+
+    The probe maps initial-frame embedding → agent_pos (x, y).  This measures
+    whether the encoder has captured spatial structure, independent of the
+    action sequence.
 
     Returns predicted class (0 or 1), or None if model/probe unavailable.
     """
     if model is None or probe is None:
         return None
 
+    from cf_oracle import oracle_rollout as _oracle_rollout
+
     # Render initial frame: (1, 1, C, H, W)
     obs = _render_obs(env_params, img_size, transform).to(device)
 
-    # Prepare action tensor: (1, 1, T, action_dim)  [B=1, S=1, T, A]
-    act_t = torch.from_numpy(actions).float().to(device)  # (T, A)
-    act_t = act_t.unsqueeze(0).unsqueeze(0)               # (1, 1, T, A)
-
-    info = {"pixels": obs}
-    # rollout expects pixels (B, S, T, C, H, W); obs is (1, 1, C, H, W)
-    # Expand to include the S=1 sample dimension.
-    info["pixels"] = obs.unsqueeze(1)  # (1, 1, 1, C, H, W) -> need (B,S,T,C,H,W)
-    # Actually rollout() signature: pixels (B,S,T,...), actions (B,S,T,A).
-    # We have B=1, S=1, T=history_size initial frames.
-    # Use encode() + autoregressive predict manually for clarity.
-
-    # Encode the initial frame (no sample dim for encode)
-    encode_info = {"pixels": obs}  # (1, 1, C, H, W)  — B=1, T=1
+    # Encode the initial frame only — no rollout needed
+    encode_info = {"pixels": obs}  # (1, 1, C, H, W)
     model.encode(encode_info)
-    emb = encode_info["emb"]  # (1, T_hist, D)
+    init_emb = encode_info["emb"][:, -1, :]  # (1, D)
 
-    # Autoregressively predict for each action step
-    act_seq = torch.from_numpy(actions).float().to(device)  # (T, A)
-    HS = history_size
-    for t in range(len(actions)):
-        a = act_seq[t : t + 1].unsqueeze(0)  # (1, 1, A)
-        act_emb = model.action_encoder(a)     # (1, 1, A_emb)
-        emb_trunc = emb[:, -HS:]
-        act_trunc = act_emb[:, -1:]
-        pred_emb = model.predict(emb_trunc, act_trunc)[:, -1:]  # (1, 1, D)
-        emb = torch.cat([emb, pred_emb], dim=1)
+    # Regress agent_pos from the initial embedding
+    pos_norm = probe(init_emb)                                    # (1, 2)
+    pos_pred = pos_norm * probe_stats["pos_std"] + probe_stats["pos_mean"]  # (1, 2)
+    agent_pos_pred = pos_pred[0].cpu().numpy()                    # (2,)
 
-    # Final predicted embedding: last step, (1, D)
-    final_emb = emb[:, -1, :]  # (1, D)
-    pred_class = probe.predict_pass(final_emb)  # (1,)
-    return int(pred_class.item())
+    # Use oracle rollout with the predicted position to classify through_door.
+    # Keep all other env params (wall_x, door_y) from the original env_params.
+    pred_params = dict(env_params)
+    pred_params["agent_pos"] = agent_pos_pred
+    result = _oracle_rollout(pred_params, actions)
+    return int(result["through_door"])
 
 
 # ── Per-task metric computation ────────────────────────────────────────────────
@@ -153,10 +154,11 @@ def _model_predict_pass(
 def compute_task_metrics(
     task_name: str,
     task_cfg: DictConfig,
-    dataset,
+    h5_path: str,
     rng: np.random.Generator,
     model,
-    probe: LinearProbe | None,
+    probe: MLPProbe | None,
+    probe_stats: dict | None,
     img_size: int,
     transform,
     device: torch.device,
@@ -166,7 +168,7 @@ def compute_task_metrics(
     print(f"\n[{task_name}] Collecting effectful samples...")
     t0 = time.time()
     samples, n_attempts, accept_rate = collect_effectful_samples(
-        task_name, task_cfg, dataset, rng
+        task_name, task_cfg, h5_path, rng
     )
     t_sample = time.time() - t0
     print(
@@ -186,15 +188,15 @@ def compute_task_metrics(
     pass_change_total = 0
     total_correct = 0
 
-    for s in samples:
+    for s in tqdm(samples, desc=f"  {task_name} inference", unit="pair", leave=False):
         oracle_pass_changed = s["pass_changed"]  # bool
 
         fact_pred = _model_predict_pass(
-            model, probe, s["fact_params"], s["actions"],
+            model, probe, probe_stats, s["fact_params"], s["actions"],
             img_size, transform, device, history_size,
         )
         cf_pred = _model_predict_pass(
-            model, probe, s["cf_params"], s["actions"],
+            model, probe, probe_stats, s["cf_params"], s["actions"],
             img_size, transform, device, history_size,
         )
 
@@ -253,16 +255,13 @@ def run(cfg: DictConfig) -> None:
     print("Loading world model...")
     model = _load_jepa(cfg, device)
 
-    print("Loading linear probe...")
-    probe = _load_probe(cfg.probe_ckpt, device)
+    print("Loading probe...")
+    probe, probe_stats = _load_probe(cfg.probe_ckpt, device)
     if probe is None:
         print("  No probe found — pass/fail accuracy metrics will be skipped.")
 
-    print("Loading dataset...")
-    dataset = swm.data.HDF5Dataset(
-        cfg.dataset.name,
-        keys_to_cache=OmegaConf.to_container(cfg.dataset.keys_to_cache),
-    )
+    h5_path = str(Path(get_cache_dir()) / f"{cfg.dataset.name}.h5")
+    print(f"Dataset: {h5_path}")
 
     all_metrics: dict[str, dict] = {}
     total_t0 = time.time()
@@ -273,8 +272,8 @@ def run(cfg: DictConfig) -> None:
             continue
         task_cfg = getattr(cfg, task_name)
         task_metrics = compute_task_metrics(
-            task_name, task_cfg, dataset, rng,
-            model, probe, img_size, transform, device, history_size,
+            task_name, task_cfg, h5_path, rng,
+            model, probe, probe_stats, img_size, transform, device, history_size,
         )
         all_metrics[task_name] = task_metrics
 

@@ -29,8 +29,8 @@ class TwoRoomCFEnv(TwoRoomEnv):
         # ── door_y intervention ──────────────────────────────────────────
         # Must happen before super().reset() calls _cache_params().
         if "door_y" in options:
-            door_y = float(options["door_y"])
-            pos_val = self.variation_space["door"]["position"].value.copy()
+            door_y = int(round(float(options["door_y"])))
+            pos_val = np.asarray(self.variation_space["door"]["position"].value, dtype=int).copy()
             pos_val[0] = door_y
             self.variation_space["door"]["position"].set_value(pos_val)
 

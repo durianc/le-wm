@@ -9,7 +9,8 @@ toy_experiments/
 __pycache__/
 *.py[cod]
 *$py.class
-
+test_env.py
+test_gpu.py
 # C extensions
 *.so
 

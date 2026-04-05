@@ -21,6 +21,7 @@ from torchvision.transforms import v2 as T
 import stable_worldmodel as swm
 from stable_worldmodel.data.utils import get_cache_dir
 from cf_env import register_cf_env
+from utils import add_model_suffix
 
 register_cf_env()
 
@@ -316,7 +317,7 @@ def run(cfg: DictConfig) -> None:
     print(f"\nTotal time: {elapsed:.1f}s")
 
     # ── Persist ────────────────────────────────────────────────────────────────
-    out_path = Path(cfg.output.filename)
+    out_path = add_model_suffix(cfg.output.filename, cfg.policy)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     result = {
         "config": OmegaConf.to_container(cfg, resolve=True),

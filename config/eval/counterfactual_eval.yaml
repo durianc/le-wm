@@ -20,7 +20,7 @@ seed: 42
 policy: random   # override with actual ckpt name, e.g. lewm/tworoom/run_xyz
 
 # Linear probe checkpoint (trained via probe.py).
-probe_ckpt: probe.pt
+probe_ckpt: /mnt/data/szeluresearch/stable-wm/tworoom/probe.pt
 
 # World model embed dim (must match the loaded checkpoint).
 wm:
@@ -111,4 +111,4 @@ do_door_y_wall_x:
   max_attempts: 5000
 
 output:
-  filename: cf_results.json
+  filename: logs_eval/cf_results.json

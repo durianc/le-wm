@@ -1,7 +1,7 @@
 {
   "config": {
     "seed": 42,
-    "policy": "tworoom/lejepa",
+    "policy": "tworoom/pldm",
     "probe_ckpt": "probe.pt",
     "wm": {
       "embed_dim": 192,
@@ -141,19 +141,19 @@
       "max_attempts": 5000
     },
     "output": {
-      "filename": "cf_results.json"
+      "filename": "logs_eval/cf_results.json"
     }
   },
   "metrics": {
     "do_location": {
       "n_samples": 100,
-      "n_attempts": 212,
-      "accept_rate": 0.4716981132075472,
+      "n_attempts": 205,
+      "accept_rate": 0.4878048780487805,
       "mean_effect_mse_oracle": NaN,
       "pass_change_frac": 1.0,
-      "effect_pass_acc_given_oracle_change": 0.48,
+      "effect_pass_acc_given_oracle_change": 0.45,
       "n_oracle_change": 100,
-      "mean_pair_accuracy": 0.56
+      "mean_pair_accuracy": 0.465
     },
     "do_door_y": {
       "n_samples": 0,
@@ -162,24 +162,24 @@
     },
     "do_wall_x": {
       "n_samples": 100,
-      "n_attempts": 362,
-      "accept_rate": 0.27624309392265195,
+      "n_attempts": 382,
+      "accept_rate": 0.2617801047120419,
       "mean_effect_mse_oracle": NaN,
       "pass_change_frac": 1.0,
-      "effect_pass_acc_given_oracle_change": 0.46,
+      "effect_pass_acc_given_oracle_change": 0.37,
       "n_oracle_change": 100,
-      "mean_pair_accuracy": 0.63
+      "mean_pair_accuracy": 0.615
     },
     "do_door_y_wall_x": {
       "n_samples": 100,
-      "n_attempts": 400,
-      "accept_rate": 0.25,
+      "n_attempts": 323,
+      "accept_rate": 0.30959752321981426,
       "mean_effect_mse_oracle": NaN,
       "pass_change_frac": 1.0,
-      "effect_pass_acc_given_oracle_change": 0.35,
+      "effect_pass_acc_given_oracle_change": 0.48,
       "n_oracle_change": 100,
-      "mean_pair_accuracy": 0.605
+      "mean_pair_accuracy": 0.66
     }
   },
-  "elapsed_seconds": 117.4423999786377
+  "elapsed_seconds": 156.03027415275574
 }

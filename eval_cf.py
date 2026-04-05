@@ -10,7 +10,7 @@ For each of the four intervention tasks the script:
 
 Run
 ---
-python eval_cf.py policy=<ckpt_name> probe_ckpt=<probe.pt>
+python eval_cf.py policy=<ckpt_name> probe_ckpt=<logs_eval/probes/probe.pt>
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from stable_worldmodel.data.utils import get_cache_dir
 from cf_env import register_cf_env
 from cf_sampler import collect_effectful_samples
 from probe import MLPProbe
+from utils import add_model_suffix, resolve_model_artifact_path
 
 register_cf_env()
 
@@ -291,7 +292,7 @@ def run(cfg: DictConfig) -> None:
     print(f"\nTotal time: {elapsed:.1f}s")
 
     # ── Persist ───────────────────────────────────────────────────────────────
-    out_path = Path(cfg.output.filename)
+    out_path = add_model_suffix(cfg.output.filename, cfg.policy)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     result = {
         "config": OmegaConf.to_container(cfg, resolve=True),

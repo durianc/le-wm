@@ -14,7 +14,7 @@ the door under fixed physics.
 Usage
 -----
 python linear_probe.py  --model_ckpt <path>  --dataset tworoom
-                        --probe_ckpt probe.pt  --epochs 100
+                        --probe_ckpt logs_eval/probes/probe.pt  --epochs 100
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from tqdm import tqdm
 
 import stable_worldmodel as swm
 from cf_env import register_cf_env
+from utils import add_model_suffix
 
 register_cf_env()
 
@@ -223,7 +224,7 @@ def main():
     parser.add_argument("--model_ckpt", required=True,
                         help="Path to world model checkpoint (run name or path).")
     parser.add_argument("--dataset", default="tworoom", help="Dataset name.")
-    parser.add_argument("--probe_ckpt", default="probe.pt",
+    parser.add_argument("--probe_ckpt", default="/mnt/data/szeluresearch/stable-wm/tworoom/probe.pt",
                         help="Where to save probe weights.")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -263,6 +264,7 @@ def main():
     pos_mean = positions.mean(dim=0)
     pos_std  = positions.std(dim=0).clamp(min=1e-6)
     save_path = Path(args.probe_ckpt)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "state_dict": probe.state_dict(),

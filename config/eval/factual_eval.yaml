@@ -1,6 +1,6 @@
 seed: 42                                                                                                                                                           
 policy: random                                                                                                                                                     
-probe_ckpt: probe.pt                                                                                                                                               
+probe_ckpt: /mnt/data/szeluresearch/stable-wm/tworoom/probe.pt
                                                                                                                                                                     
 wm:                                                                                                                                                                
   embed_dim: 192                                                                                                                                                   
@@ -18,4 +18,4 @@ factual:
   open_loop: true    # false = teacher-forced                                                                                                                      
                                                                                                                                                                     
 output:                                                                                                                                                            
-  filename: factual_results.json 
+  filename: logs_eval/factual_results.json  

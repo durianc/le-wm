@@ -2,7 +2,7 @@
   "config": {
     "seed": 42,
     "policy": "tworoom/lewm",
-    "probe_ckpt": "probe.pt",
+    "probe_ckpt": "/mnt/data/szeluresearch/stable-wm/tworoom/probe.pt",
     "wm": {
       "embed_dim": 192,
       "history_size": 1
@@ -19,7 +19,7 @@
       "open_loop": true
     },
     "output": {
-      "filename": "factual_results.json"
+      "filename": "logs_eval/factual_results.json"
     }
   },
   "metrics": {
@@ -71,5 +71,5 @@
     "n_episodes": 200,
     "drift_slope": 0.027141524109107057
   },
-  "elapsed_seconds": 51.33758544921875
+  "elapsed_seconds": 58.32276391983032
 }

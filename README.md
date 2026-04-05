@@ -84,6 +84,8 @@ python eval.py --config-name=pusht.yaml policy=pusht/lewm
 python eval.py --config-name=pusht.yaml policy=pusht/lewm_object.ckpt
 ```
 
+Two-room factual and counterfactual eval outputs now default to `logs_eval/`, and the saved filenames are automatically suffixed with the model name to avoid collisions between runs.
+
 ## Pretrained Checkpoints
 
 Pre-trained checkpoints are available on [Google Drive](https://drive.google.com/drive/folders/1r31os0d4-rR0mdHc7OlY_e5nh3XT4r4e). Download the checkpoint archive and place the extracted files under `$STABLEWM_HOME/`.

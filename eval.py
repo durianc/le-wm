@@ -16,6 +16,63 @@ from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
 
 
+def load_lewm_model(policy_ref: str, cache_dir=None) -> torch.nn.Module | None:
+    """Load a LeWM model from a lewm/ directory containing weights.pt.
+
+    Infers architecture from weight shapes — no config.json required.
+    Returns None if no weights.pt is found (non-lewm checkpoint).
+    """
+    from jepa import JEPA
+    from module import ARPredictor, Embedder, MLP
+    from stable_pretraining.backbone.utils import vit_hf
+
+    # Resolve path: absolute or relative to cache_dir
+    p = Path(policy_ref)
+    if p.suffix == ".pt" and p.exists():
+        weights_path = p
+    else:
+        for candidate in (p, Path(cache_dir or swm.data.utils.get_cache_dir()) / policy_ref):
+            if candidate.is_dir():
+                w = candidate / "weights.pt"
+                if w.exists():
+                    weights_path = w
+                    break
+        else:
+            return None  # not a lewm checkpoint
+
+    ckpt = torch.load(weights_path, map_location="cpu", weights_only=False)
+
+    # Infer architecture from weight shapes
+    act_input_dim    = ckpt["action_encoder.patch_embed.weight"].shape[1]
+    hidden_dim       = ckpt["projector.net.0.weight"].shape[0]
+    embed_dim        = ckpt["projector.net.0.weight"].shape[1]
+    predictor_frames = ckpt["predictor.pos_embedding"].shape[1]
+    predictor_depth  = sum(
+        1 for k in ckpt
+        if k.startswith("predictor.transformer.layers.")
+        and k.endswith(".adaLN_modulation.1.weight")
+    )
+    proj_norm = torch.nn.BatchNorm1d if "projector.net.1.running_mean" in ckpt else torch.nn.LayerNorm
+
+    encoder = vit_hf(size="tiny", patch_size=14, image_size=224, pretrained=False, use_mask_token=False)
+    predictor = ARPredictor(
+        num_frames=predictor_frames, input_dim=embed_dim, hidden_dim=embed_dim,
+        output_dim=embed_dim, depth=predictor_depth, heads=16, mlp_dim=2048,
+        dim_head=64, dropout=0.1, emb_dropout=0.0,
+    )
+    action_encoder = Embedder(input_dim=act_input_dim, emb_dim=embed_dim)
+    projector  = MLP(input_dim=embed_dim, output_dim=embed_dim, hidden_dim=hidden_dim, norm_fn=proj_norm)
+    pred_proj  = MLP(input_dim=embed_dim, output_dim=embed_dim, hidden_dim=hidden_dim, norm_fn=proj_norm)
+
+    model = JEPA(encoder, predictor, action_encoder, projector, pred_proj)
+    missing, unexpected = model.load_state_dict(ckpt, strict=False)
+    if missing:
+        raise RuntimeError(f"Missing keys when loading lewm weights: {missing}")
+    if unexpected:
+        print(f"  [warn] Ignored unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+    return model
+
+
 def patch_gcrl_compat(model):
     """Patch backward-compat attributes for older serialized GCRL modules."""
     for module in model.modules():
@@ -189,10 +246,10 @@ def run(cfg: DictConfig):
     policy = cfg.get("policy", "random")
 
     if policy != "random":
-        try:
-            model = swm.policy.AutoCostModel(cfg.policy)
+        # Try lewm weights.pt loading first
+        model = load_lewm_model(cfg.policy)
+        if model is not None:
             model = model.to("cuda")
-            model = patch_gcrl_compat(model)
             model = model.eval()
             model.requires_grad_(False)
             model.interpolate_pos_encoding = True
@@ -201,20 +258,33 @@ def run(cfg: DictConfig):
             policy = swm.policy.WorldModelPolicy(
                 solver=solver, config=config, process=process, transform=transform
             )
-        except RuntimeError as e:
-            # Fallback for direct policy checkpoints (e.g., GCBC/IQL/IVL) that
-            # expose get_action but not get_cost.
-            if "get_cost" not in str(e):
-                raise
-            model = swm.policy.AutoActionableModel(cfg.policy)
-            model = model.to("cuda")
-            model = patch_gcrl_compat(model)
-            model = model.eval()
-            model.requires_grad_(False)
-            policy = FastActionablePolicy(
-                model=model, process=process, transform=transform
-                , img_size=cfg.eval.img_size
-            )
+        else:
+            try:
+                model = swm.policy.AutoCostModel(cfg.policy)
+                model = model.to("cuda")
+                model = patch_gcrl_compat(model)
+                model = model.eval()
+                model.requires_grad_(False)
+                model.interpolate_pos_encoding = True
+                config = swm.PlanConfig(**cfg.plan_config)
+                solver = hydra.utils.instantiate(cfg.solver, model=model)
+                policy = swm.policy.WorldModelPolicy(
+                    solver=solver, config=config, process=process, transform=transform
+                )
+            except RuntimeError as e:
+                # Fallback for direct policy checkpoints (e.g., GCBC/IQL/IVL) that
+                # expose get_action but not get_cost.
+                if "get_cost" not in str(e):
+                    raise
+                model = swm.policy.AutoActionableModel(cfg.policy)
+                model = model.to("cuda")
+                model = patch_gcrl_compat(model)
+                model = model.eval()
+                model.requires_grad_(False)
+                policy = FastActionablePolicy(
+                    model=model, process=process, transform=transform
+                    , img_size=cfg.eval.img_size
+                )
 
     else:
         policy = swm.policy.RandomPolicy()

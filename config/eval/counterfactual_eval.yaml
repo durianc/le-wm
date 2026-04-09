@@ -69,12 +69,15 @@ do_door_y:
   wall_x_fact: 112
   # door_y_fact ≈ 54: matches actual agent y-centroid when crossing wall
   door_y_fact: 54
-  # CF doors far outside [35, 70] so agent trajectory (y≈54) misses them
-  door_y_cf: [100, 120, 140, 160, 180]
+  # Keep CF doors away from the factual center but still inside the observed y-range.
+  # Crossing y range: [33, 65], mean≈53. CF values must be outside this band.
+  door_y_cf: [18, 24, 34, 74, 84, 94]
   action_source: "dataset"
   skip_same_value_eps: 5.0
   require_effectful: true
-  min_oracle_effect_mse: 5.0
+  # door_y intervention does NOT change agent positions (only through_door logic),
+  # so effect_mse_oracle is always 0. Disable MSE filter; pass_change is sufficient.
+  min_oracle_effect_mse: 0.0
   require_oracle_pass_change: true
   # Pre-filter: only use episodes where agent passes within 22px of wall_x_fact
   wall_proximity_margin: 22.0
@@ -99,7 +102,7 @@ do_door_y_wall_x:
   wall_x_fact: 112
   door_y_fact: 54
   wall_x_cf: [55, 70, 154, 169]
-  door_y_cf: [100, 120, 140, 160, 180]
+  door_y_cf: [18, 24, 34, 74, 84, 94]
   pair_sampling: "random_k"
   k_pairs_per_sample: 4
   skip_same_value_eps: 5.0

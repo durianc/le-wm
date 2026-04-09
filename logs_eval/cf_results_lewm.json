@@ -1,0 +1,192 @@
+{
+  "config": {
+    "seed": 42,
+    "policy": "tworoom/lewm",
+    "probe_ckpt": "tworoom_eval/probe.pt",
+    "wm": {
+      "embed_dim": 192,
+      "history_size": 1
+    },
+    "dataset": {
+      "name": "tworoom",
+      "keys_to_cache": [
+        "action",
+        "proprio"
+      ]
+    },
+    "env": {
+      "img_size": 224
+    },
+    "do_location": {
+      "t_intervene": [
+        3,
+        5,
+        8,
+        10,
+        15
+      ],
+      "loc_prime": "offset_multi",
+      "loc_prime_offsets_xy": [
+        [
+          -70,
+          0
+        ],
+        [
+          70,
+          0
+        ],
+        [
+          -80,
+          0
+        ],
+        [
+          80,
+          0
+        ],
+        [
+          -60,
+          -15
+        ],
+        [
+          60,
+          15
+        ],
+        [
+          -60,
+          15
+        ],
+        [
+          60,
+          -15
+        ],
+        [
+          -50,
+          0
+        ],
+        [
+          50,
+          0
+        ]
+      ],
+      "use_fact_wall_door": true,
+      "action_source": "dataset",
+      "require_effectful": true,
+      "min_oracle_effect_mse": 5.0,
+      "require_oracle_pass_change": true,
+      "wall_proximity_margin": 999.0,
+      "target_effectful_n": 100,
+      "max_attempts": 5000
+    },
+    "do_door_y": {
+      "wall_x_fact": 112,
+      "door_y_fact": 54,
+      "door_y_cf": [
+        18,
+        24,
+        34,
+        74,
+        84,
+        94
+      ],
+      "action_source": "dataset",
+      "skip_same_value_eps": 5.0,
+      "require_effectful": true,
+      "min_oracle_effect_mse": 0.0,
+      "require_oracle_pass_change": true,
+      "wall_proximity_margin": 22.0,
+      "target_effectful_n": 100,
+      "max_attempts": 5000
+    },
+    "do_wall_x": {
+      "wall_x_fact": 112,
+      "wall_x_cf": [
+        55,
+        70,
+        154,
+        169
+      ],
+      "door_y_fact": 54,
+      "action_source": "dataset",
+      "skip_same_value_eps": 5.0,
+      "require_effectful": true,
+      "min_oracle_effect_mse": 5.0,
+      "require_oracle_pass_change": true,
+      "wall_proximity_margin": 22.0,
+      "target_effectful_n": 100,
+      "max_attempts": 5000
+    },
+    "do_door_y_wall_x": {
+      "wall_x_fact": 112,
+      "door_y_fact": 54,
+      "wall_x_cf": [
+        55,
+        70,
+        154,
+        169
+      ],
+      "door_y_cf": [
+        18,
+        24,
+        34,
+        74,
+        84,
+        94
+      ],
+      "pair_sampling": "random_k",
+      "k_pairs_per_sample": 4,
+      "skip_same_value_eps": 5.0,
+      "require_effectful": true,
+      "min_oracle_effect_mse": 5.0,
+      "require_oracle_pass_change": true,
+      "wall_proximity_margin": 22.0,
+      "target_effectful_n": 100,
+      "max_attempts": 5000
+    },
+    "output": {
+      "filename": "logs_eval/cf_results.json"
+    }
+  },
+  "metrics": {
+    "do_location": {
+      "n_samples": 100,
+      "n_attempts": 406,
+      "accept_rate": 0.24630541871921183,
+      "pass_change_frac": 1.0,
+      "mean_effect_mse_oracle": 1484.785025253296,
+      "effect_pass_acc_given_oracle_change": 0.51,
+      "n_oracle_change": 100,
+      "mean_pair_accuracy": 0.495
+    },
+    "do_door_y": {
+      "n_samples": 100,
+      "n_attempts": 483,
+      "accept_rate": 0.2070393374741201,
+      "pass_change_frac": 1.0,
+      "mean_effect_mse_oracle": 0.0,
+      "effect_pass_acc_given_oracle_change": 0.18,
+      "n_oracle_change": 100,
+      "mean_pair_accuracy": 0.48
+    },
+    "do_wall_x": {
+      "n_samples": 100,
+      "n_attempts": 882,
+      "accept_rate": 0.11337868480725624,
+      "pass_change_frac": 1.0,
+      "mean_effect_mse_oracle": 164.01988883018493,
+      "effect_pass_acc_given_oracle_change": 0.46,
+      "n_oracle_change": 100,
+      "mean_pair_accuracy": 0.48
+    },
+    "do_door_y_wall_x": {
+      "n_samples": 100,
+      "n_attempts": 746,
+      "accept_rate": 0.13404825737265416,
+      "pass_change_frac": 1.0,
+      "mean_effect_mse_oracle": 154.67962809562684,
+      "effect_pass_acc_given_oracle_change": 0.43,
+      "n_oracle_change": 100,
+      "mean_pair_accuracy": 0.555
+    }
+  },
+  "elapsed_seconds": 57.36571383476257
+}

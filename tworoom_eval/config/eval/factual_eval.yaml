@@ -1,0 +1,21 @@
+seed: 42                                                                                                                                                           
+policy: random                                                                                                                                                     
+probe_ckpt: tworoom_eval/probe.pt
+                                                                                                                                                                    
+wm:                                                                                                                                                                
+  embed_dim: 192                                                                                                                                                   
+  history_size: 1                                                                                                                                                  
+                                                                                                                                                                    
+dataset:                                                                                                                                                           
+  name: tworoom                                                                                                                                                    
+                                                                                                                                                                    
+env:                                                                                                                                                               
+  img_size: 224                                                                                                                                                    
+                                                                                                                                                                    
+factual:                                                                                                                                                           
+  n_episodes: 200    # 无偏随机采样                                                                                                                                
+  horizon: 20        # H步展开                                                                                                                                     
+  open_loop: true    # false = teacher-forced                                                                                                                      
+                                                                                                                                                                    
+output:                                                                                                                                                            
+  filename: logs_eval/factual_results.json  

@@ -1,0 +1,117 @@
+# Counterfactual evaluation config for LeWM / TwoRoom (224×224 coordinate system).
+# Entry point: eval_cf.py
+#
+# Coordinate system reference (224×224):
+#   BORDER_SIZE = 14  →  valid agent/door range: [14, 209]
+#   WALL_CENTER = 112  →  fixed vertical wall at x=112 (wall_axis=1)
+#   WALL_WIDTH_DEFAULT = 10  →  wall occupies x ∈ [107, 117]
+#   door_y: center coord along wall y-axis, valid [14, 209]
+#   door_size (half-extent): default init=14px; agent radius default=7px
+#
+# Dataset statistics (tworoom.h5, 10 000 episodes):
+#   agent x range: [14, 209]; 87.4% of episodes cross x=112
+#   agent y when near wall (x∈[100,124]): mean=53, std=7, p10=42, p90=62
+#   → door_y_fact should be ≈54 (actual wall-crossing y centroid)
+#   → CF door_y values should be far from [35,70] to guarantee pass change
+
+seed: 42
+
+# World model checkpoint (run name or absolute path).
+policy: random   # override with actual ckpt name, e.g. lewm/tworoom/run_xyz
+
+# Linear probe checkpoint (trained via probe.py).
+probe_ckpt: tworoom_eval/probe.pt
+
+# World model embed dim (must match the loaded checkpoint).
+wm:
+  embed_dim: 192
+  history_size: 1
+
+# Dataset (h5_path is resolved automatically from dataset.name + STABLEWM_HOME).
+dataset:
+  name: tworoom
+  keys_to_cache:
+    - action
+    - proprio
+
+# Shared env rendering parameters.
+env:
+  img_size: 224
+
+# ── Per-task configs ──────────────────────────────────────────────────────────
+
+do_location:
+  t_intervene: [3, 5, 8, 10, 15]
+  loc_prime: "offset_multi"
+  # Horizontal offsets large enough to cross wall at x=112.
+  loc_prime_offsets_xy:
+    - [-70, 0]
+    - [70, 0]
+    - [-80, 0]
+    - [80, 0]
+    - [-60, -15]
+    - [60, 15]
+    - [-60, 15]
+    - [60, -15]
+    - [-50, 0]
+    - [50, 0]
+  use_fact_wall_door: true
+  action_source: "dataset"
+  require_effectful: true
+  min_oracle_effect_mse: 5.0     # pass_change alone is sufficient
+  require_oracle_pass_change: true
+  # No wall pre-filter for do_location (offset itself is the structural change)
+  wall_proximity_margin: 999.0   # effectively disabled
+  target_effectful_n: 100
+  max_attempts: 5000
+
+do_door_y:
+  wall_x_fact: 112
+  # door_y_fact ≈ 54: matches actual agent y-centroid when crossing wall
+  door_y_fact: 54
+  # Keep CF doors away from the factual center but still inside the observed y-range.
+  # Crossing y range: [33, 65], mean≈53. CF values must be outside this band.
+  door_y_cf: [18, 24, 34, 74, 84, 94]
+  action_source: "dataset"
+  skip_same_value_eps: 5.0
+  require_effectful: true
+  # door_y intervention does NOT change agent positions (only through_door logic),
+  # so effect_mse_oracle is always 0. Disable MSE filter; pass_change is sufficient.
+  min_oracle_effect_mse: 0.0
+  require_oracle_pass_change: true
+  # Pre-filter: only use episodes where agent passes within 22px of wall_x_fact
+  wall_proximity_margin: 22.0
+  target_effectful_n: 100
+  max_attempts: 5000
+
+do_wall_x:
+  wall_x_fact: 112
+  # Move wall far enough that episodes crossing x=112 don't cross the new wall
+  wall_x_cf: [55, 70, 154, 169]
+  door_y_fact: 54
+  action_source: "dataset"
+  skip_same_value_eps: 5.0
+  require_effectful: true
+  min_oracle_effect_mse: 5.0
+  require_oracle_pass_change: true
+  wall_proximity_margin: 22.0
+  target_effectful_n: 100
+  max_attempts: 5000
+
+do_door_y_wall_x:
+  wall_x_fact: 112
+  door_y_fact: 54
+  wall_x_cf: [55, 70, 154, 169]
+  door_y_cf: [18, 24, 34, 74, 84, 94]
+  pair_sampling: "random_k"
+  k_pairs_per_sample: 4
+  skip_same_value_eps: 5.0
+  require_effectful: true
+  min_oracle_effect_mse: 5.0
+  require_oracle_pass_change: true
+  wall_proximity_margin: 22.0
+  target_effectful_n: 100
+  max_attempts: 5000
+
+output:
+  filename: logs_eval/cf_results.json

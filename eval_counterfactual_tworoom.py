@@ -11,7 +11,7 @@ overrides the wall position and door y-coordinate for the current episode.
 
 Usage
 -----
-python eval_counterfactual.py policy=tworoom/lewm [num_episodes=50] [seed=42]
+python eval_counterfactual_tworoom.py policy=tworoom/lewm [num_episodes=50] [seed=42]
 
 Output
 ------

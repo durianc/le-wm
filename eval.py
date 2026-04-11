@@ -1,6 +1,7 @@
 import os
 
-os.environ["MUJOCO_GL"] = "egl"
+# Respect an explicit backend chosen by the caller. Default to EGL for headless runs.
+os.environ.setdefault("MUJOCO_GL", "egl")
 
 import time
 from pathlib import Path
@@ -15,6 +16,72 @@ from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+
+def evaluate_in_batches(
+    cfg: DictConfig,
+    dataset,
+    policy,
+    episodes_idx: np.ndarray,
+    start_steps: np.ndarray,
+    results_path: Path,
+):
+    """Evaluate a fixed episode set in configurable batches.
+
+    The sampled episodes are kept identical to the unbatched path. We only
+    split execution into smaller groups of parallel envs to reduce peak memory.
+    """
+    total = len(episodes_idx)
+    batch_size = int(cfg.eval.get("batch_size", total))
+    if batch_size <= 0:
+        raise ValueError("eval.batch_size must be a positive integer.")
+
+    batch_successes = []
+    batch_seeds = []
+    callables = OmegaConf.to_container(cfg.eval.get("callables"), resolve=True)
+    save_video = bool(cfg.eval.get("save_video", True))
+    img_size = int(cfg.eval.img_size)
+
+    for batch_start in range(0, total, batch_size):
+        batch_end = min(batch_start + batch_size, total)
+        batch_episodes = episodes_idx[batch_start:batch_end]
+        batch_start_steps = start_steps[batch_start:batch_end]
+
+        batch_world_cfg = OmegaConf.to_container(cfg.world, resolve=True)
+        batch_world_cfg["num_envs"] = len(batch_episodes)
+        batch_world_cfg["max_episode_steps"] = 2 * cfg.eval.eval_budget
+
+        world = swm.World(**batch_world_cfg, image_shape=(img_size, img_size))
+        world.set_policy(policy)
+
+        print(
+            f"Evaluating batch {batch_start // batch_size + 1}/"
+            f"{(total + batch_size - 1) // batch_size} "
+            f"with {len(batch_episodes)} episodes."
+        )
+        metrics = world.evaluate_from_dataset(
+            dataset,
+            start_steps=batch_start_steps.tolist(),
+            goal_offset_steps=cfg.eval.goal_offset_steps,
+            eval_budget=cfg.eval.eval_budget,
+            episodes_idx=batch_episodes.tolist(),
+            callables=callables,
+            save_video=save_video,
+            video_path=results_path,
+        )
+        batch_successes.append(np.asarray(metrics["episode_successes"], dtype=bool))
+        if metrics.get("seeds") is not None:
+            batch_seeds.append(np.asarray(metrics["seeds"]))
+
+    episode_successes = np.concatenate(batch_successes)
+    aggregated_metrics = {
+        "success_rate": float(np.mean(episode_successes)) * 100.0,
+        "episode_successes": episode_successes,
+        "seeds": np.concatenate(batch_seeds) if batch_seeds else None,
+    }
+    return aggregated_metrics
 
 def load_lewm_model(policy_ref: str, cache_dir=None) -> torch.nn.Module | None:
     """Load a LeWM model from a lewm/ directory containing weights.pt.
@@ -213,11 +280,6 @@ def run(cfg: DictConfig):
         cfg.plan_config.horizon * cfg.plan_config.action_block <= cfg.eval.eval_budget
     ), "Planning horizon must be smaller than or equal to eval_budget"
 
-    # create world environment
-    cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
-    img_size = int(cfg.eval.img_size)
-    world = swm.World(**cfg.world, image_shape=(img_size, img_size))
-
     # create the transform
     transform = {
         "pixels": img_transform(cfg),
@@ -326,17 +388,14 @@ def run(cfg: DictConfig):
     if len(eval_episodes) < cfg.eval.num_eval:
         raise ValueError("Not enough episodes with sufficient length for evaluation.")
 
-    world.set_policy(policy)
-
     start_time = time.time()
-    metrics = world.evaluate_from_dataset(
-        dataset,
-        start_steps=eval_start_idx.tolist(),
-        goal_offset_steps=cfg.eval.goal_offset_steps,
-        eval_budget=cfg.eval.eval_budget,
-        episodes_idx=eval_episodes.tolist(),
-        callables=OmegaConf.to_container(cfg.eval.get("callables"), resolve=True),
-        video_path=results_path,
+    metrics = evaluate_in_batches(
+        cfg,
+        dataset=dataset,
+        policy=policy,
+        episodes_idx=np.asarray(eval_episodes),
+        start_steps=np.asarray(eval_start_idx),
+        results_path=results_path,
     )
     end_time = time.time()
     

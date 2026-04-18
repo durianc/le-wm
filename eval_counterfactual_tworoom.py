@@ -57,6 +57,9 @@ INTERVENTIONS: list[tuple[str, int | None, float | None]] = [
     ("do_wall_x",         170,   None),    # wall shifted right
     ("do_door_y_wall_x",  170,   180.0),   # both shifted (strongest OOD)
     ("do_location",       None,  None),    # agent starts in right room — handled separately
+    ("do_reverse_task",   None,  None),    # agent starts right, goal in left (full reversal)
+    ("do_wall_color",     None,  None),    # bright blue walls (visual appearance shift)
+    ("do_checkerboard",   None,  None),    # high-contrast checkerboard floor
 ]
 
 # For do_location we override agent start pos instead of wall/door.
@@ -67,11 +70,20 @@ DO_LOCATION_POSITIONS = [
     [140, 175], [160, 175], [185, 25], [185, 190],
 ]
 
+# For do_reverse_task: sample positions randomly in valid ranges
+# (computed per episode, not fixed list)
+
 
 def _make_intervention_callable(
     wall_x: int | None,
     door_y: float | None,
     agent_pos: list[float] | None = None,
+    goal_pos: list[float] | None = None,
+    wall_color: list[int] | None = None,
+    bg_color: list[int] | None = None,
+    checkerboard: bool = False,
+    sample_reverse_positions: bool = False,
+    seed: int = 42,
 ) -> dict:
     """
     Build a callable spec understood by world.evaluate_from_dataset.
@@ -82,9 +94,15 @@ def _make_intervention_callable(
     return {
         "method": "_set_intervention",
         "args": {
-            "wall_x":    {"value": wall_x,    "in_dataset": False},
-            "door_y":    {"value": door_y,    "in_dataset": False},
-            "agent_pos": {"value": agent_pos, "in_dataset": False},
+            "wall_x":                  {"value": wall_x,                  "in_dataset": False},
+            "door_y":                  {"value": door_y,                  "in_dataset": False},
+            "agent_pos":               {"value": agent_pos,               "in_dataset": False},
+            "goal_pos":                {"value": goal_pos,                "in_dataset": False},
+            "wall_color":              {"value": wall_color,              "in_dataset": False},
+            "bg_color":                {"value": bg_color,                "in_dataset": False},
+            "checkerboard":            {"value": checkerboard,            "in_dataset": False},
+            "sample_reverse_positions": {"value": sample_reverse_positions, "in_dataset": False},
+            "seed":                    {"value": seed,                    "in_dataset": False},
         },
     }
 
@@ -101,8 +119,56 @@ def patch_cf_env(env_name: str) -> None:
     import torch as _torch
     import numpy as _np
 
-    def _set_intervention(self, wall_x=None, door_y=None, agent_pos=None):
+    def _set_intervention(self, wall_x=None, door_y=None, agent_pos=None, goal_pos=None,
+                          wall_color=None, bg_color=None, checkerboard=False,
+                          sample_reverse_positions=False, seed=42):
         """Apply structural intervention after dataset state has been set."""
+
+        # For do_reverse_task: sample random positions in right/left rooms
+        if sample_reverse_positions:
+            # Use a counter to ensure different positions per episode
+            if not hasattr(self, '_reverse_counter'):
+                self._reverse_counter = 0
+
+            rng = _np.random.default_rng(seed + self._reverse_counter)
+            self._reverse_counter += 1
+
+            # Valid ranges (accounting for border + agent radius)
+            BORDER_SIZE = 14
+            AGENT_RADIUS = 7.0
+            WALL_CENTER = 112
+            WALL_HALF = 5  # wall_width // 2
+
+            min_coord = BORDER_SIZE + AGENT_RADIUS  # 21
+            max_coord = 224 - BORDER_SIZE - AGENT_RADIUS  # 203
+
+            # Right room: x in [WALL_CENTER + WALL_HALF + AGENT_RADIUS, max_coord]
+            right_x_min = WALL_CENTER + WALL_HALF + AGENT_RADIUS  # 124
+            right_x_max = max_coord  # 203
+
+            # Left room: x in [min_coord, WALL_CENTER - WALL_HALF - AGENT_RADIUS]
+            left_x_min = min_coord  # 21
+            left_x_max = WALL_CENTER - WALL_HALF - AGENT_RADIUS  # 100
+
+            # Get door position to sample y near it
+            door_y = float(self.door_positions[0].item())
+
+            # Sample y within reasonable range of door (±60 pixels)
+            # This ensures paths are feasible within eval_budget
+            y_margin = 60.0
+            y_min = max(min_coord, door_y - y_margin)  # at least 21
+            y_max = min(max_coord, door_y + y_margin)  # at most 203
+
+            # Sample agent position in right room
+            agent_x = float(rng.uniform(right_x_min, right_x_max))
+            agent_y = float(rng.uniform(y_min, y_max))
+            agent_pos = [agent_x, agent_y]
+
+            # Sample goal position in left room
+            goal_x = float(rng.uniform(left_x_min, left_x_max))
+            goal_y = float(rng.uniform(y_min, y_max))
+            goal_pos = [goal_x, goal_y]
+
         # wall_x override
         if wall_x is not None:
             self.WALL_CENTER = int(wall_x)
@@ -111,18 +177,78 @@ def patch_cf_env(env_name: str) -> None:
 
         # door_y override — update the variation space value
         if door_y is not None:
-            pos_val = np.asarray(
+            pos_val = _np.asarray(
                 self.variation_space["door"]["position"].value, dtype=int
             ).copy()
             pos_val[0] = int(round(float(door_y)))
             self.variation_space["door"]["position"].set_value(pos_val)
             self._cache_params()
 
-        # agent_pos override (do_location)
+        # agent_pos override (do_location, do_reverse_task)
         if agent_pos is not None:
             self.agent_position = _torch.tensor(
                 agent_pos, dtype=_torch.float32
             )
+
+        # goal_pos override (do_reverse_task)
+        if goal_pos is not None:
+            self.target_position = _torch.tensor(
+                goal_pos, dtype=_torch.float32
+            )
+            # Also update variation_space to keep it in sync
+            self.variation_space["target"]["position"].set_value(
+                _np.array(goal_pos, dtype=_np.float32)
+            )
+
+        # wall_color override (do_wall_color)
+        if wall_color is not None:
+            self.variation_space["wall"]["color"].set_value(
+                _np.array(wall_color, dtype=_np.uint8)
+            )
+
+        # bg_color override (for checkerboard base)
+        if bg_color is not None:
+            self.variation_space["background"]["color"].set_value(
+                _np.array(bg_color, dtype=_np.uint8)
+            )
+
+        # checkerboard override (do_checkerboard)
+        if checkerboard:
+            # Store checkerboard flag so _render_frame can use it
+            self._use_checkerboard = True
+            # Monkey-patch _render_frame to add checkerboard
+            original_render = self._render_frame
+            def _render_with_checkerboard(agent_pos):
+                img = original_render(agent_pos)
+                # Add checkerboard pattern to background
+                H = W = self.IMG_SIZE
+                tile_size = 28  # 28x28 tiles for 224x224 image (8x8 grid)
+                y_idx = _torch.arange(H, device=img.device) // tile_size
+                x_idx = _torch.arange(W, device=img.device) // tile_size
+                y_grid, x_grid = _torch.meshgrid(y_idx, x_idx, indexing='ij')
+                checker = ((y_grid + x_grid) % 2).to(_torch.uint8)
+
+                # Create mask for non-wall, non-agent, non-target areas
+                # We'll apply checkerboard only to "background" pixels
+                # Simple heuristic: pixels that are close to bg_color
+                bg = self.variation_space["background"]["color"].value
+                bg_tensor = _torch.tensor([bg[0], bg[1], bg[2]], dtype=_torch.uint8, device=img.device).view(3, 1, 1)
+
+                # Checkerboard colors: dark gray (80) and light gray (200)
+                dark = 80
+                light = 200
+
+                # Apply checkerboard to all channels
+                for c in range(3):
+                    # Where checker is 0, use dark; where 1, use light
+                    checker_channel = _torch.where(checker == 0, dark, light).to(_torch.uint8)
+                    # Blend with existing image based on whether it's background
+                    # Simple approach: if pixel is close to white (bg), replace with checker
+                    is_bg = (img[c] > 240)  # white-ish pixels
+                    img[c] = _torch.where(is_bg, checker_channel, img[c])
+
+                return img
+            self._render_frame = _render_with_checkerboard
 
         # Re-render the goal image with the (possibly updated) geometry
         self._target_img = self._render_frame(agent_pos=self.target_position)
@@ -192,6 +318,11 @@ def run_one_intervention(
     wall_x: int | None,
     door_y: float | None,
     agent_pos_override: list[float] | None,
+    goal_pos_override: list[float] | None,
+    wall_color_override: list[int] | None,
+    bg_color_override: list[int] | None,
+    checkerboard_override: bool,
+    sample_reverse_positions: bool,
     *,
     policy,
     world,
@@ -201,14 +332,21 @@ def run_one_intervention(
     goal_offset_steps: int,
     eval_budget: int,
     base_callables: list[dict],
+    seed: int,
 ) -> dict:
     """Run evaluate_from_dataset for one intervention type."""
 
     # Build callables: base (set_state + set_goal_state) + intervention
     callables = list(base_callables)
-    if wall_x is not None or door_y is not None or agent_pos_override is not None:
+    if (wall_x is not None or door_y is not None or agent_pos_override is not None
+        or goal_pos_override is not None or wall_color_override is not None
+        or bg_color_override is not None or checkerboard_override or sample_reverse_positions):
         callables.append(
-            _make_intervention_callable(wall_x, door_y, agent_pos_override)
+            _make_intervention_callable(
+                wall_x, door_y, agent_pos_override, goal_pos_override,
+                wall_color_override, bg_color_override, checkerboard_override,
+                sample_reverse_positions, seed
+            )
         )
 
     # Reset policy action buffer between interventions
@@ -337,18 +475,36 @@ def main():
     for iname, wall_x, door_y in INTERVENTIONS:
         print(f"\n[{iname}]  wall_x={wall_x}  door_y={door_y}")
 
+        agent_pos_ov = None
+        goal_pos_ov = None
+        wall_color_ov = None
+        bg_color_ov = None
+        checkerboard_ov = False
+        sample_reverse = False
+
         if iname == "do_location":
             # For do_location we randomly pick one OOD start position per run.
             rng_loc = np.random.default_rng(cfg.seed + 1)
             idx = int(rng_loc.integers(0, len(DO_LOCATION_POSITIONS)))
             agent_pos_ov = DO_LOCATION_POSITIONS[idx]
             print(f"  agent_pos_override={agent_pos_ov}")
-        else:
-            agent_pos_ov = None
+        elif iname == "do_reverse_task":
+            # For do_reverse_task: sample random positions in right/left rooms
+            sample_reverse = True
+            print(f"  sampling agent in RIGHT room, goal in LEFT room")
+        elif iname == "do_wall_color":
+            # Bright blue walls instead of black
+            wall_color_ov = [30, 144, 255]  # dodger blue
+            print(f"  wall_color_override={wall_color_ov}")
+        elif iname == "do_checkerboard":
+            # High-contrast checkerboard floor
+            checkerboard_ov = True
+            print(f"  checkerboard=True")
 
         t0 = time.time()
         metrics = run_one_intervention(
-            iname, wall_x, door_y, agent_pos_ov,
+            iname, wall_x, door_y, agent_pos_ov, goal_pos_ov,
+            wall_color_ov, bg_color_ov, checkerboard_ov, sample_reverse,
             policy=policy,
             world=world,
             dataset=dataset,
@@ -357,6 +513,7 @@ def main():
             goal_offset_steps=cfg.eval.goal_offset_steps,
             eval_budget=cfg.eval.eval_budget,
             base_callables=base_callables,
+            seed=cfg.seed,
         )
         elapsed_i = time.time() - t0
 

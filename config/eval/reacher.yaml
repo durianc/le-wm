@@ -31,7 +31,7 @@ eval:
   goal_offset_steps: 25
   eval_budget: 50
   img_size: 224
-  save_video: true
+  save_video: false
   dataset_name: reacher
   callables:
     # -- set state

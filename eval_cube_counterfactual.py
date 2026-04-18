@@ -6,9 +6,10 @@ performance when the physical dynamics differ from training.
 
 Interventions:
   - baseline: No modifications
-  - heavy_cube: Increase cube mass to 5x (tests mass estimation)
-  - low_friction: Reduce friction to 0.1x (tests contact dynamics)
-  - visual_counterfactual: Swap cube/agent colors or make floor similar to cube
+  - visual_counterfactual: Visual counterfactuals on cube appearance and scene layout
+  - visual_cube_color_ood: Change only cube colors to an unseen OOD palette
+  - cube_size: Scale cube size up or down
+  - ood_position: Move initial/goal positions to near-OOD or far-OOD regions
 
 Usage:
   python eval_cube_counterfactual.py policy=cube/lewm [num_episodes=50] [seed=42]
@@ -58,11 +59,58 @@ class InterventionSpec:
 
 INTERVENTIONS: list[InterventionSpec] = [
     InterventionSpec("baseline", "baseline"),
-    InterventionSpec("heavy_cube", "mass", 5.0),
-    InterventionSpec("low_friction", "friction", 0.1),
+    InterventionSpec("visual_cf_cube_color_ood", "visual_cube_color_ood"),
     InterventionSpec("visual_cf_swap", "visual_swap"),
     InterventionSpec("visual_cf_floor", "visual_floor"),
+    InterventionSpec("cube_size_small", "size_scale", 0.75),
+    InterventionSpec("cube_size_large", "size_scale", 1.25),
+    InterventionSpec("near_ood_init", "near_ood_init"),
+    InterventionSpec("far_ood_init", "far_ood_init"),
+    InterventionSpec("far_ood_goal", "far_ood_goal"),
 ]
+
+
+def print_results_table(
+    results: list[dict],
+    baseline_sr: float | None,
+    title: str,
+) -> None:
+    """Print a compact ASCII table for evaluation results."""
+    headers = ("Intervention", "SR (%)", "ΔSR (%)", "Dist Mean", "Dist Std", "Episodes")
+    rows = []
+    for result in results:
+        sr = float(result["success_rate"])
+        delta_sr = sr - baseline_sr if baseline_sr is not None else 0.0
+        rows.append(
+            (
+                str(result["intervention"]),
+                f"{sr:.2f}",
+                f"{delta_sr:+.2f}",
+                f"{float(result['final_distance_mean']):.4f}",
+                f"{float(result['final_distance_std']):.4f}",
+                str(int(result["num_episodes"])),
+            )
+        )
+
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def format_row(row: tuple[str, ...]) -> str:
+        return " | ".join(
+            cell.ljust(widths[i]) if i == 0 else cell.rjust(widths[i])
+            for i, cell in enumerate(row)
+        )
+
+    separator = "-+-".join("-" * width for width in widths)
+
+    print(title, flush=True)
+    print(format_row(headers), flush=True)
+    print(separator, flush=True)
+    for row in rows:
+        print(format_row(row), flush=True)
+    print(flush=True)
 
 
 def parse_args() -> dict:
@@ -90,6 +138,88 @@ def parse_args() -> dict:
 def patch_cube_env_with_intervention():
     """Monkey-patch CubeEnv to add _apply_cf_intervention method."""
     from stable_worldmodel.envs.ogbench.cube_env import CubeEnv
+
+    def _pick_nearest_candidate(current_xy, candidates):
+        current_xy = np.asarray(current_xy, dtype=np.float64)
+        candidates = np.asarray(candidates, dtype=np.float64)
+        distances = np.linalg.norm(candidates - current_xy[None, :], axis=1)
+        return candidates[int(np.argmin(distances))]
+
+    def _pick_farthest_candidate(current_xy, candidates):
+        current_xy = np.asarray(current_xy, dtype=np.float64)
+        candidates = np.asarray(candidates, dtype=np.float64)
+        distances = np.linalg.norm(candidates - current_xy[None, :], axis=1)
+        return candidates[int(np.argmax(distances))]
+
+    def _set_cube_xy(self, cube_id, xy):
+        joint = self._data.joint(f"object_joint_{cube_id}")
+        joint.qpos[:2] = np.asarray(xy, dtype=np.float64)
+        mujoco.mj_forward(self._model, self._data)
+
+    def _set_cube_target_xy(self, cube_id, xy):
+        mocap_id = self._cube_target_mocap_ids[cube_id]
+        self._data.mocap_pos[mocap_id][:2] = np.asarray(xy, dtype=np.float64)
+        mujoco.mj_forward(self._model, self._data)
+
+    def _apply_cube_size_scale(self, scale):
+        for i in range(self._num_cubes):
+            joint = self._data.joint(f"object_joint_{i}")
+            current_half_extent = float(self._model.geom_size[self._cube_geom_ids_list[i][0]][2])
+            new_half_extent = current_half_extent * float(scale)
+            delta_half_extent = new_half_extent - current_half_extent
+            joint.qpos[2] += delta_half_extent
+
+            for geom_id in self._cube_geom_ids_list[i]:
+                self._model.geom_size[geom_id][:3] *= float(scale)
+
+            for geom_id in self._cube_target_geom_ids_list[i]:
+                self._model.geom_size[geom_id][:3] *= float(scale)
+
+            mocap_id = self._cube_target_mocap_ids[i]
+            self._data.mocap_pos[mocap_id][2] += delta_half_extent
+
+        mujoco.mj_forward(self._model, self._data)
+
+    def _apply_position_counterfactual(self, mode):
+        cube_id = 0
+        current_xy = self._data.joint(f"object_joint_{cube_id}").qpos[:2].copy()
+        current_goal_xy = self._data.mocap_pos[self._cube_target_mocap_ids[cube_id]][:2].copy()
+
+        near_ood_candidates = np.array(
+            [
+                [0.3875, -0.10],
+                [0.3875, 0.10],
+                [0.4625, -0.10],
+                [0.4625, 0.10],
+                [0.4250, -0.15],
+                [0.4250, 0.15],
+            ],
+            dtype=np.float64,
+        )
+
+        edge_candidates = np.array(
+            [
+                [0.31, -0.29],
+                [0.31, 0.29],
+                [0.54, -0.29],
+                [0.54, 0.29],
+                [0.31, 0.00],
+                [0.54, 0.00],
+                [0.425, -0.29],
+                [0.425, 0.29],
+            ],
+            dtype=np.float64,
+        )
+
+        if mode == "near_ood_init":
+            new_xy = _pick_nearest_candidate(current_xy, near_ood_candidates)
+            _set_cube_xy(self, cube_id, new_xy)
+        elif mode == "far_ood_init":
+            new_xy = _pick_farthest_candidate(current_xy, edge_candidates)
+            _set_cube_xy(self, cube_id, new_xy)
+        elif mode == "far_ood_goal":
+            new_xy = _pick_farthest_candidate(current_goal_xy, edge_candidates)
+            _set_cube_target_xy(self, cube_id, new_xy)
 
     def _apply_cf_intervention(self, intervention_kind=None, intervention_value=None):
         """Apply counterfactual intervention to MuJoCo model."""
@@ -136,6 +266,24 @@ def patch_cube_env_with_intervention():
                 if geom_id >= 0:
                     model.geom(geom_id).rgba[:3] = cube_colors[0]
 
+        elif intervention_kind == "visual_cube_color_ood":
+            # Use a saturated cyan/teal palette that is outside the default training colors.
+            ood_palette = np.array(
+                [
+                    [0.00, 0.92, 0.92],
+                    [0.00, 0.78, 0.86],
+                    [0.10, 0.88, 0.72],
+                    [0.18, 0.82, 0.96],
+                ],
+                dtype=np.float64,
+            )
+            for i in range(self._num_cubes):
+                cube_color = ood_palette[i % len(ood_palette)]
+                for gid in self._cube_geom_ids_list[i]:
+                    model.geom(gid).rgba[:3] = cube_color
+                for gid in self._cube_target_geom_ids_list[i]:
+                    model.geom(gid).rgba[:3] = cube_color
+
         elif intervention_kind == "visual_floor":
             if self._num_cubes > 0:
                 cube_color = model.geom(self._cube_geom_ids_list[0][0]).rgba[:3].copy()
@@ -144,6 +292,12 @@ def patch_cube_env_with_intervention():
                 floor_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
                 if floor_geom_id >= 0:
                     model.geom(floor_geom_id).rgba[:3] = floor_color
+
+        elif intervention_kind == "size_scale":
+            _apply_cube_size_scale(self, intervention_value)
+
+        elif intervention_kind in {"near_ood_init", "far_ood_init", "far_ood_goal"}:
+            _apply_position_counterfactual(self, intervention_kind)
 
     CubeEnv._apply_cf_intervention = _apply_cf_intervention
 
@@ -186,7 +340,11 @@ def run_intervention_group(
     batch_successes = []
     img_size = int(cfg.eval.img_size)
 
-    print(f"  Running {intervention.name:20s} ({total} episodes in batches of {batch_size})...")
+    print(
+        f"[Evaluating] intervention={intervention.name} kind={intervention.kind} "
+        f"episodes={total} batch_size={batch_size}",
+        flush=True,
+    )
 
     for batch_start in range(0, total, batch_size):
         batch_end = min(batch_start + batch_size, total)
@@ -214,6 +372,10 @@ def run_intervention_group(
         )
 
         batch_successes.append(np.asarray(metrics["episode_successes"], dtype=bool))
+        print(
+            f"  batch {batch_start}:{batch_end} finished for {intervention.name}",
+            flush=True,
+        )
 
     # Aggregate results
     successes = np.concatenate(batch_successes)
@@ -368,35 +530,26 @@ def main(cfg: DictConfig):
         if intervention.kind == "baseline":
             baseline_sr = result["success_rate"]
 
-        # Print result immediately after completion
-        sr = result["success_rate"]
-        delta_sr = sr - baseline_sr if baseline_sr is not None else 0.0
-        dist_mean = result["final_distance_mean"]
-        dist_std = result["final_distance_std"]
-
-        print(f"  ✓ {intervention.name:<22} SR: {sr:>6.2f}%  ΔSR: {delta_sr:>+7.2f}%  Dist: {dist_mean:.4f}±{dist_std:.4f}\n")
+        print(f"[Completed] intervention={intervention.name}", flush=True)
+        print_results_table(
+            [result],
+            baseline_sr=baseline_sr,
+            title="Current Group Result",
+        )
 
     elapsed = time.time() - start_time
 
     # Print final summary table
-    print(f"{'='*80}")
-    print(f"Final Results Summary")
-    print(f"{'='*80}")
-    print(f"{'Intervention':<25} {'SR (%)':<10} {'ΔSR (%)':<10} {'Dist (mean±std)':<20}")
-    print(f"{'-'*80}")
-
-    for intervention in INTERVENTIONS:
-        result = all_results[intervention.name]
-        sr = result["success_rate"]
-        delta_sr = sr - baseline_sr if baseline_sr is not None else 0.0
-        dist_mean = result["final_distance_mean"]
-        dist_std = result["final_distance_std"]
-
-        print(f"{intervention.name:<25} {sr:>8.2f}  {delta_sr:>+9.2f}  {dist_mean:>8.4f}±{dist_std:<8.4f}")
-
-    print(f"{'-'*80}")
-    print(f"Total time: {elapsed:.1f}s")
-    print(f"{'='*80}\n")
+    print(f"{'='*80}", flush=True)
+    print("Final Results Summary", flush=True)
+    print(f"{'='*80}", flush=True)
+    print_results_table(
+        [all_results[intervention.name] for intervention in INTERVENTIONS],
+        baseline_sr=baseline_sr,
+        title="All Groups",
+    )
+    print(f"Total time: {elapsed:.1f}s", flush=True)
+    print(f"{'='*80}\n", flush=True)
 
     # Save results
     output_path = Path(args["output"])
@@ -414,7 +567,7 @@ def main(cfg: DictConfig):
     with output_path.open("w") as f:
         json.dump(output_data, f, indent=2)
 
-    print(f"Results saved to: {output_path}")
+    print(f"Results saved to: {output_path}", flush=True)
 
 
 if __name__ == "__main__":

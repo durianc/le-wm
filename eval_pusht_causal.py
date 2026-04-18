@@ -10,15 +10,16 @@ The rollout is closed-loop: a policy is queried at every step until the episode
 terminates or the evaluation budget is exhausted.
 
 Interventions covered:
-  A1. do(init_pos)          - move the T-block to boundary positions unseen in training
-  A2. do(init_angle)        - rotate the T-block by 90 or 180 degrees at reset
-  B.  do(target_pose)       - shift the goal pose away from the default center
+  A1. do(init_pos)          - move the T-block to boundary or near-boundary positions
+  A2. do(init_angle)        - rotate the T-block by mild or large angles at reset
+  B1. do(target_pose)       - shift only the T-block goal position
+  B2. do(target_angle)      - rotate only the T-block goal angle
   C.  do(visual_distractor) - change the T-block color
   D.  do(object_scale)      - resize the T-block (20 / 60)
 
 Usage
 -----
-python eval_pusht_causal.py policy=pusht/lewm
+python eval_pusht_new.py policy=pusht/lewm
 
 By default the script reuses the PushT evaluation config from
 config/eval/pusht.yaml.
@@ -29,6 +30,7 @@ import json
 import os
 import sys
 import time
+import types
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +41,7 @@ import gymnasium as gym
 import hydra
 import numpy as np
 import torch
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 from sklearn import preprocessing
 from tqdm import tqdm
@@ -57,6 +60,11 @@ BOUNDARY_INIT_POSITIONS = [
     np.array([450.0, 450.0], dtype=np.float64),
 ]
 
+MILD_INIT_POSITIONS = [
+    np.array([90.0, 90.0], dtype=np.float64),
+    np.array([110.0, 110.0], dtype=np.float64),
+]
+
 TARGET_POSE_POSITIONS = [
     np.array([80.0, 80.0], dtype=np.float64),
     np.array([80.0, 430.0], dtype=np.float64),
@@ -66,7 +74,13 @@ TARGET_POSE_POSITIONS = [
     np.array([430.0, 256.0], dtype=np.float64),
 ]
 
-TARGET_POSE_ANGLES = [0.0, np.pi / 2, np.pi, 3 * np.pi / 2]
+MICRO_TARGET_POSE_POSITIONS = [
+    np.array([261.0, 261.0], dtype=np.float64),
+]
+
+TINY_TARGET_POSE_POSITIONS = [
+    np.array([268.0, 268.0], dtype=np.float64),
+]
 
 VISUAL_DISTRACTOR_COLORS = [
     np.array([255, 96, 0], dtype=np.uint8),
@@ -84,10 +98,28 @@ class InterventionSpec:
 
 INTERVENTIONS: list[InterventionSpec] = [
     InterventionSpec("baseline", "baseline"),
+    InterventionSpec("do_init_pos_mild", "init_pos", MILD_INIT_POSITIONS),
     InterventionSpec("do_init_pos_boundary", "init_pos"),
-    InterventionSpec("do_init_angle_90", "init_angle", np.pi / 2),
-    InterventionSpec("do_init_angle_180", "init_angle", np.pi),
+    InterventionSpec("do_init_angle_10", "init_angle", np.pi / 18),
+    InterventionSpec("do_init_angle_20", "init_angle", np.pi / 9),
+    InterventionSpec("do_init_angle_30", "init_angle", np.pi / 6),
+    InterventionSpec("do_init_angle_45", "init_angle", np.pi / 4),
+    InterventionSpec(
+        "do_target_pose_micro_shift",
+        "target_pose",
+        {"positions": MICRO_TARGET_POSE_POSITIONS, "keep_angle": True},
+    ),
+    InterventionSpec(
+        "do_target_pose_tiny_shift",
+        "target_pose",
+        {"positions": TINY_TARGET_POSE_POSITIONS, "keep_angle": True},
+    ),
     InterventionSpec("do_target_pose", "target_pose"),
+    InterventionSpec("do_target_angle_10", "target_angle", np.pi / 18),
+    InterventionSpec("do_target_angle_20", "target_angle", np.pi / 9),
+    InterventionSpec("do_target_angle_30", "target_angle", np.pi / 6),
+    InterventionSpec("do_target_angle_45", "target_angle", np.pi / 4),
+    InterventionSpec("do_checkerboard", "background_checkerboard"),
     InterventionSpec("do_visual_distractor", "visual_distractor"),
     InterventionSpec("do_object_scale_20", "object_scale", 20.0),
     InterventionSpec("do_object_scale_60", "object_scale", 60.0),
@@ -161,6 +193,8 @@ def _prepare_env_state(env, state: np.ndarray) -> None:
     env.agent.position = state[:2].tolist()
     env.block.angle = float(state[4])
     env.block.position = state[2:4].tolist()
+    # CRITICAL FIX: Step physics to update rendering state
+    env.space.step(env.dt)
 
 
 def _episode_variation(
@@ -171,8 +205,8 @@ def _episode_variation(
 ) -> tuple[np.ndarray, np.ndarray, dict | None, np.ndarray]:
     """Return modified init/goal states, reset options, and goal pose.
 
-    The target pose intervention changes the evaluation goal itself; the visual
-    and scale interventions only alter rendering / geometry.
+    Target interventions change only the T-block goal components; the visual and
+    scale interventions only alter rendering / geometry.
     """
 
     init_state_mod = np.array(init_state, dtype=np.float64, copy=True)
@@ -183,18 +217,27 @@ def _episode_variation(
         pass
 
     elif spec.kind == "init_pos":
-        init_state_mod[2:4] = _pick_from_pool(BOUNDARY_INIT_POSITIONS, episode_seed)
+        pool = spec.value if spec.value is not None else BOUNDARY_INIT_POSITIONS
+        init_state_mod[2:4] = _pick_from_pool(pool, episode_seed)
 
     elif spec.kind == "init_angle":
         init_state_mod[4] = _wrap_angle(goal_state_mod[4] + float(spec.value))
 
     elif spec.kind == "target_pose":
-        # Keep the agent state from the current start and only move the target pose.
-        goal_state_mod = np.array(init_state_mod, dtype=np.float64, copy=True)
-        goal_state_mod[2:4] = _pick_from_pool(TARGET_POSE_POSITIONS, episode_seed)
-        goal_state_mod[4] = _wrap_angle(
-            TARGET_POSE_ANGLES[episode_seed % len(TARGET_POSE_ANGLES)]
-        )
+        # Only move the T-block goal position; keep agent goal and target angle.
+        keep_angle = False
+        if isinstance(spec.value, dict):
+            pool = spec.value.get("positions", TARGET_POSE_POSITIONS)
+            keep_angle = bool(spec.value.get("keep_angle", False))
+        else:
+            pool = spec.value if spec.value is not None else TARGET_POSE_POSITIONS
+        goal_state_mod[2:4] = _pick_from_pool(pool, episode_seed)
+        if keep_angle:
+            goal_state_mod[4] = goal_state[4]
+
+    elif spec.kind == "target_angle":
+        # Only rotate the T-block goal angle; keep agent goal and target position.
+        goal_state_mod[4] = _wrap_angle(goal_state_mod[4] + float(spec.value))
 
     elif spec.kind == "visual_distractor":
         color = VISUAL_DISTRACTOR_COLORS[episode_seed % len(VISUAL_DISTRACTOR_COLORS)]
@@ -266,6 +309,338 @@ def _summarize_episode_result(metrics: list[dict], baseline_sr: float) -> dict:
     }
 
 
+def _patch_lewm_batch_criterion(model: torch.nn.Module) -> torch.nn.Module:
+    """Patch installed LeWM so CEM env batches >1 broadcast goal embeddings correctly."""
+
+    def criterion(self, info_dict: dict):
+        pred_emb = info_dict["predicted_emb"]  # (B, S, T, D)
+        goal_emb = info_dict["goal_emb"]  # (B, T, D) in the installed package
+
+        if goal_emb.ndim == 3:
+            goal_emb = goal_emb.unsqueeze(1)  # (B, 1, T, D)
+
+        goal_emb = goal_emb[..., -1:, :].expand_as(pred_emb)
+        return F.mse_loss(
+            pred_emb[..., -1:, :],
+            goal_emb[..., -1:, :].detach(),
+            reduction="none",
+        ).sum(dim=tuple(range(2, pred_emb.ndim)))
+
+    model.criterion = types.MethodType(criterion, model)
+    return model
+
+
+def _patch_lewm_cached_get_cost(model: torch.nn.Module) -> torch.nn.Module:
+    """Cache goal embeddings within a single replan to avoid repeated ViT encodes."""
+
+    def get_cost(self, info_dict: dict, action_candidates: torch.Tensor):
+        assert "goal" in info_dict, "goal not in info_dict"
+
+        device = next(self.parameters()).device
+        for k in list(info_dict.keys()):
+            if torch.is_tensor(info_dict[k]):
+                info_dict[k] = info_dict[k].to(device)
+
+        goal_cache = getattr(self, "_cached_goal_emb", None)
+        if goal_cache is None:
+            goal_cache = {}
+            self._cached_goal_emb = goal_cache
+
+        goal_tensor = info_dict["goal"]
+        cache_key = (
+            goal_tensor.data_ptr(),
+            tuple(goal_tensor.shape),
+            goal_tensor.device.type,
+            goal_tensor.device.index,
+        )
+        goal_emb = goal_cache.get(cache_key)
+        if goal_emb is None:
+            goal = {k: v[:, 0] for k, v in info_dict.items() if torch.is_tensor(v)}
+            goal["pixels"] = goal["goal"]
+
+            goal_aliases = {}
+            for k in list(goal.keys()):
+                if k.startswith("goal_"):
+                    goal_aliases[k[len("goal_") :]] = goal[k]
+            goal.update(goal_aliases)
+            goal.pop("action", None)
+
+            goal = self.encode(goal)
+            goal_emb = goal["emb"].detach()
+            goal_cache[cache_key] = goal_emb
+
+        info_dict["goal_emb"] = goal_emb
+        info_dict = self.rollout(info_dict, action_candidates)
+        return self.criterion(info_dict)
+
+    model._cached_goal_emb = {}
+    model.get_cost = types.MethodType(get_cost, model)
+    return model
+
+
+def _patch_policy_clear_goal_cache(policy: swm.policy.WorldModelPolicy) -> swm.policy.WorldModelPolicy:
+    """Clear cached goal embeddings before each new CEM replan."""
+
+    original_get_action = policy.get_action
+
+    def get_action(self, info_dict: dict, **kwargs):
+        if len(self._action_buffer) == 0 and hasattr(self.solver.model, "_cached_goal_emb"):
+            self.solver.model._cached_goal_emb = {}
+        return original_get_action(info_dict, **kwargs)
+
+    policy.get_action = types.MethodType(get_action, policy)
+    return policy
+
+
+def _patch_fast_world_model_policy(
+    policy: swm.policy.WorldModelPolicy, img_size: int
+) -> swm.policy.WorldModelPolicy:
+    """Replace per-image transforms with batched resize/normalize for planning."""
+
+    policy._fast_img_size = int(img_size)
+    policy._fast_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1)
+    policy._fast_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
+
+    def _prepare_image_tensor(self, x):
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(x)
+        if x.ndim != 5:
+            return x
+
+        if x.shape[-1] == 3:
+            x = x.permute(0, 1, 4, 2, 3).contiguous()
+        x = x.float()
+        if x.numel() > 0 and x.max() > 1.0:
+            x = x / 255.0
+
+        h, w = x.shape[-2], x.shape[-1]
+        if h != self._fast_img_size or w != self._fast_img_size:
+            et = x.shape[:2]
+            x = x.view(-1, *x.shape[-3:])
+            x = F.interpolate(
+                x,
+                size=(self._fast_img_size, self._fast_img_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+            x = x.view(*et, *x.shape[-3:])
+
+        mean = self._fast_mean.to(device=x.device, dtype=x.dtype)
+        std = self._fast_std.to(device=x.device, dtype=x.dtype)
+        return (x - mean) / std
+
+    def get_action(self, info_dict: dict, **kwargs) -> np.ndarray:
+        assert hasattr(self, "env"), "Environment not set for the policy"
+        assert "pixels" in info_dict, "'pixels' must be provided in info_dict"
+        assert "goal" in info_dict, "'goal' must be provided in info_dict"
+
+        info_dict = dict(info_dict)
+
+        for k, v in list(info_dict.items()):
+            if not isinstance(v, (np.ndarray, np.generic)):
+                continue
+            if hasattr(self, "process") and k in self.process:
+                shape = v.shape
+                if len(shape) > 2:
+                    v_flat = v.reshape(-1, *shape[2:])
+                else:
+                    v_flat = v
+                v = self.process[k].transform(v_flat).reshape(shape)
+            info_dict[k] = v
+
+        if "goal" in info_dict:
+            info_dict["goal_pixels"] = info_dict["goal"]
+
+        for key in ("pixels", "goal", "goal_pixels"):
+            if key in info_dict:
+                info_dict[key] = self._prepare_image_tensor(info_dict[key])
+
+        for k, v in list(info_dict.items()):
+            if isinstance(v, (np.ndarray, np.generic)) and v.dtype.kind not in "USO":
+                info_dict[k] = torch.from_numpy(v)
+
+        device = next(self.solver.model.parameters()).device
+        for k, v in info_dict.items():
+            if torch.is_tensor(v):
+                info_dict[k] = v.to(device, non_blocking=True)
+
+        if len(self._action_buffer) == 0:
+            if hasattr(self.solver.model, "_cached_goal_emb"):
+                self.solver.model._cached_goal_emb = {}
+            outputs = self.solver(info_dict, init_action=self._next_init)
+
+            actions = outputs["actions"]
+            keep_horizon = self.cfg.receding_horizon
+            plan = actions[:, :keep_horizon]
+            rest = actions[:, keep_horizon:]
+            self._next_init = rest if self.cfg.warm_start else None
+
+            plan = plan.reshape(self.env.num_envs, self.flatten_receding_horizon, -1)
+            self._action_buffer.extend(plan.transpose(0, 1))
+
+        action = self._action_buffer.popleft()
+        action = action.reshape(*self.env.action_space.shape)
+        action = action.numpy()
+
+        if "action" in self.process:
+            action = self.process["action"].inverse_transform(action)
+
+        return action
+
+    policy._prepare_image_tensor = types.MethodType(_prepare_image_tensor, policy)
+    policy.get_action = types.MethodType(get_action, policy)
+    return policy
+
+
+def _patch_cem_solver_no_step_sync(solver) -> object:
+    """Delay CPU transfers in CEM until the end of each env sub-batch."""
+
+    def solve(self, info_dict: dict, init_action: torch.Tensor | None = None) -> dict:
+        with torch.inference_mode():
+            start_time = time.time()
+            outputs = {"costs": [], "mean": [], "var": []}
+
+            mean, var = self.init_action_distrib(init_action)
+            mean = mean.to(self.device)
+            var = var.to(self.device)
+
+            total_envs = self.n_envs
+            for start_idx in range(0, total_envs, self.batch_size):
+                end_idx = min(start_idx + self.batch_size, total_envs)
+                current_bs = end_idx - start_idx
+
+                batch_mean = mean[start_idx:end_idx]
+                batch_var = var[start_idx:end_idx]
+
+                expanded_infos = {}
+                for k, v in info_dict.items():
+                    v_batch = v[start_idx:end_idx]
+                    if torch.is_tensor(v):
+                        v_batch = v_batch.unsqueeze(1)
+                        v_batch = v_batch.expand(current_bs, self.num_samples, *v_batch.shape[2:])
+                    elif isinstance(v, np.ndarray):
+                        v_batch = np.repeat(v_batch[:, None, ...], self.num_samples, axis=1)
+                    expanded_infos[k] = v_batch
+
+                final_batch_cost = None
+                for _ in range(self.n_steps):
+                    candidates = torch.randn(
+                        current_bs,
+                        self.num_samples,
+                        self.horizon,
+                        self.action_dim,
+                        generator=self.torch_gen,
+                        device=self.device,
+                    )
+                    candidates = candidates * batch_var.unsqueeze(1) + batch_mean.unsqueeze(1)
+                    candidates[:, 0] = batch_mean
+
+                    costs = self.model.get_cost(expanded_infos.copy(), candidates)
+                    topk_vals, topk_inds = torch.topk(costs, k=self.topk, dim=1, largest=False)
+
+                    batch_indices = torch.arange(current_bs, device=self.device).unsqueeze(1).expand(-1, self.topk)
+                    topk_candidates = candidates[batch_indices, topk_inds]
+
+                    batch_mean = topk_candidates.mean(dim=1)
+                    batch_var = topk_candidates.std(dim=1)
+                    final_batch_cost = topk_vals.mean(dim=1)
+
+                mean[start_idx:end_idx] = batch_mean
+                var[start_idx:end_idx] = batch_var
+                outputs["costs"].extend(final_batch_cost.cpu().tolist())
+
+            outputs["actions"] = mean.detach().cpu()
+            outputs["mean"] = [mean.detach().cpu()]
+            outputs["var"] = [var.detach().cpu()]
+            print(f"CEM solve time: {time.time() - start_time:.4f} seconds")
+            return outputs
+
+    solver.solve = types.MethodType(solve, solver)
+    return solver
+
+
+def patch_pusht_visual_interventions() -> None:
+    """Add background visual interventions to PushT via an env callable."""
+    from stable_worldmodel.envs.pusht.env import PushTEnv
+
+    if getattr(PushTEnv, "_lewm_visual_patch_installed", False):
+        return
+
+    original_render_frame = PushTEnv._render_frame
+
+    def _render_frame(self, mode):
+        img = original_render_frame(self, mode)
+
+        if not getattr(self, "_use_checkerboard", False):
+            return img
+
+        bg = np.asarray(
+            self.variation_space["background"]["color"].value, dtype=np.int16
+        )
+        img_int = img.astype(np.int16)
+        bg_mask = np.all(np.abs(img_int - bg[None, None, :]) <= 5, axis=-1)
+
+        h, w = img.shape[:2]
+        tile = max(1, h // 8)
+        y_idx = np.arange(h) // tile
+        x_idx = np.arange(w) // tile
+        checker = (y_idx[:, None] + x_idx[None, :]) % 2
+
+        dark = np.array([80, 80, 80], dtype=np.uint8)
+        light = np.array([200, 200, 200], dtype=np.uint8)
+        pattern = np.where(checker[..., None] == 0, dark, light)
+
+        out = img.copy()
+        out[bg_mask] = pattern[bg_mask]
+        return out
+
+    def _set_visual_intervention(
+        self,
+        bg_color=None,
+        checkerboard=False,
+    ):
+        self._use_checkerboard = bool(checkerboard)
+
+        if bg_color is not None:
+            self.variation_space["background"]["color"].set_value(
+                np.asarray(bg_color, dtype=np.uint8)
+            )
+
+    PushTEnv._render_frame = _render_frame
+    PushTEnv._set_visual_intervention = _set_visual_intervention
+    PushTEnv._lewm_visual_patch_installed = True
+
+
+def _make_visual_intervention_callable(
+    bg_color: list[int] | None = None,
+    checkerboard: bool = False,
+) -> dict:
+    return {
+        "method": "_set_visual_intervention",
+        "args": {
+            "bg_color": {"value": bg_color, "in_dataset": False},
+            "checkerboard": {"value": checkerboard, "in_dataset": False},
+        },
+    }
+
+
+def _callables_for_intervention(
+    base_callables: list[dict] | None,
+    spec: InterventionSpec,
+) -> list[dict] | None:
+    callables = list(base_callables or [])
+
+    if spec.kind == "background_checkerboard":
+        callables.append(
+            _make_visual_intervention_callable(
+                bg_color=[255, 255, 255],
+                checkerboard=True,
+            )
+        )
+
+    return callables
+
+
 def _make_policy(cfg, process, transform, device: torch.device):
     if cfg.policy == "random":
         return swm.policy.RandomPolicy(seed=cfg.seed)
@@ -273,16 +648,21 @@ def _make_policy(cfg, process, transform, device: torch.device):
     model = load_lewm_model(cfg.policy)
     if model is None:
         raise RuntimeError(f"Could not load model from policy={cfg.policy}")
+    model = _patch_lewm_batch_criterion(model)
+    model = _patch_lewm_cached_get_cost(model)
     model = model.to(device).eval().requires_grad_(False)
     model.interpolate_pos_encoding = True
     plan_cfg = swm.PlanConfig(**cfg.plan_config)
     solver = hydra.utils.instantiate(cfg.solver, model=model)
-    return swm.policy.WorldModelPolicy(
+    solver = _patch_cem_solver_no_step_sync(solver)
+    policy = swm.policy.WorldModelPolicy(
         solver=solver,
         config=plan_cfg,
         process=process,
         transform=transform,
     )
+    policy = _patch_policy_clear_goal_cache(policy)
+    return _patch_fast_world_model_policy(policy, img_size=int(cfg.eval.img_size))
 
 
 def _sample_eval_episodes(dataset, num_eval: int, seed: int, goal_offset_steps: int):
@@ -322,6 +702,9 @@ def _save_failed_episode_videos(
     video_root: Path,
 ) -> list[str]:
     """Save videos only for failed (terminated==False) episodes of one intervention."""
+    if not bool(cfg.eval.get("save_video", False)):
+        return []
+
     failed_idx = np.flatnonzero(~np.asarray(episode_successes, dtype=bool))
     if failed_idx.size == 0:
         return []
@@ -348,13 +731,14 @@ def _save_failed_episode_videos(
             old.unlink()
 
         intervention_dataset = _IntervenedDataset(dataset, spec, int(cfg.seed))
+        intervention_callables = _callables_for_intervention(base_callables, spec)
         fail_world.evaluate_from_dataset(
             intervention_dataset,
             start_steps=fail_start_idx,
             goal_offset_steps=int(cfg.eval.goal_offset_steps),
             eval_budget=int(cfg.eval.eval_budget),
             episodes_idx=fail_episodes,
-            callables=base_callables,
+            callables=intervention_callables,
             save_video=True,
             video_path=tmp_dir,
         )
@@ -581,6 +965,8 @@ def main():
         "goal": img_transform(cfg),
     }
 
+    patch_pusht_visual_interventions()
+
     # Align with eval.py: vectorized World + evaluate_from_dataset.
     cfg.world.max_episode_steps = 2 * int(cfg.eval.eval_budget)
     img_size = int(cfg.eval.img_size)
@@ -613,13 +999,14 @@ def main():
             policy._next_init = None
 
         intervention_dataset = _IntervenedDataset(dataset, spec, int(cfg.seed))
+        intervention_callables = _callables_for_intervention(base_callables, spec)
         metrics = world.evaluate_from_dataset(
             intervention_dataset,
             start_steps=eval_start_idx,
             goal_offset_steps=int(cfg.eval.goal_offset_steps),
             eval_budget=int(cfg.eval.eval_budget),
             episodes_idx=eval_episodes,
-            callables=base_callables,
+            callables=intervention_callables,
             save_video=False,
         )
 

@@ -1,0 +1,23 @@
+intervention,dimension,level,kind,value,success_rate,delta_sr,num_episodes,num_success
+baseline,baseline,N/A,baseline,N/A,86.00,0.00,50,43
+do_target_radius_mild,spatial_reachability,1_mild,target_radius_shift,"{'min_radius': 0.18, 'max_radius': 0.21}",76.00,-10.00,50,38
+do_target_radius_moderate,spatial_reachability,2_moderate,target_radius_shift,"{'min_radius': 0.2, 'max_radius': 0.23}",78.00,-8.00,50,39
+do_target_radius_extreme,spatial_reachability,3_extreme,target_radius_shift,"{'min_radius': 0.22, 'max_radius': 0.25}",80.00,-6.00,50,40
+do_wrist_limit_mild,kinematic_limits,1_mild,wrist_limit,"(-135.0, 135.0)",78.00,-8.00,50,39
+do_wrist_limit_moderate,kinematic_limits,2_moderate,wrist_limit,"(-90.0, 90.0)",74.00,-12.00,50,37
+do_wrist_limit_extreme,kinematic_limits,3_extreme,wrist_limit,"(-45.0, 45.0)",72.00,-14.00,50,36
+do_arm_length_short_mild,body_structure,1_mild,arm_length,0.108,68.00,-18.00,50,34
+do_arm_length_short_moderate,body_structure,2_moderate,arm_length,0.096,74.00,-12.00,50,37
+do_arm_length_short_extreme,body_structure,3_extreme,arm_length,0.084,66.00,-20.00,50,33
+do_arm_length_long_mild,body_structure,1_mild,arm_length,0.132,76.00,-10.00,50,38
+do_arm_length_long_moderate,body_structure,2_moderate,arm_length,0.144,78.00,-8.00,50,39
+do_arm_length_long_extreme,body_structure,3_extreme,arm_length,0.156,76.00,-10.00,50,38
+do_hand_length_short_mild,body_structure,1_mild,hand_length,0.09,74.00,-12.00,50,37
+do_hand_length_short_moderate,body_structure,2_moderate,hand_length,0.08,82.00,-4.00,50,41
+do_hand_length_short_extreme,body_structure,3_extreme,hand_length,0.07,76.00,-10.00,50,38
+do_hand_length_long_mild,body_structure,1_mild,hand_length,0.11,74.00,-12.00,50,37
+do_hand_length_long_moderate,body_structure,2_moderate,hand_length,0.12,68.00,-18.00,50,34
+do_hand_length_long_extreme,body_structure,3_extreme,hand_length,0.13,72.00,-14.00,50,36
+do_structure_compound_mild,body_structure,1_mild,compound_structure,"{'arm_length': 0.108, 'hand_length': 0.11}",80.00,-6.00,50,40
+do_structure_compound_moderate,body_structure,2_moderate,compound_structure,"{'arm_length': 0.096, 'hand_length': 0.12}",80.00,-6.00,50,40
+do_structure_compound_extreme,body_structure,3_extreme,compound_structure,"{'arm_length': 0.084, 'hand_length': 0.13}",82.00,-4.00,50,41
